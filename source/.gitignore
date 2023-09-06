@@ -1,2 +1,7 @@
 # .swp files
 *.swp
+
+# Plots
+*.png
+*.svg
+*.pdf

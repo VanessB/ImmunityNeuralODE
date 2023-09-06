@@ -1,4 +1,4 @@
-using DiffEqFlux, Optimization, OptimizationFlux, DifferentialEquations, LinearAlgebra
+using DiffEqFlux, Optimization, OptimizationFlux, DifferentialEquations, LinearAlgebra, Plots, LaTeXStrings, Printf
 
 
 function get_observations()
@@ -31,27 +31,26 @@ end
 
 
 function make_model()
-    basis_dim_1 = 1
-    basis_dim_2 = 1
-    output_dim = 2
     n_physically_informed_params = 5
 
-    basis = [LegendreBasis(basis_dim_1), LegendreBasis(basis_dim_2)]
-    rhs_nn = TensorLayer(basis, output_dim)
+    rhs_nn = Chain(Dense(2, 50, tanh), Dense(50, 50, tanh), Dense(50, 2)) |> f64
+    p_nn, rhs_nn = Flux.destructure(rhs_nn)
+    n_nn_params = length(p_nn)
 
     function rhs(dot_x, x, params, t)
         beta, K, alpha_E, b_i, gamma = exp.(params[begin:n_physically_informed_params])
         V, E = x
 
-        rhs_nn_output = rhs_nn(x, exp.(params[n_physically_informed_params + 1:end]))
-        dot_x[1] = beta * V * (1.0 - V / K) - gamma * V * E + rhs_nn_output[1]
-        dot_x[2] = b_i * V * E - alpha_E * E                + rhs_nn_output[2]
+        rhs_nn_output = 0.01 * rhs_nn(x, params[n_physically_informed_params + 1:end])
+        dot_x[1] = beta * V * (1.0 - V / K) - gamma * (1.0 + rhs_nn_output[1]) * V * E
+        dot_x[2] = b_i * (1.0 + rhs_nn_output[2]) * V * E - alpha_E * E
 
         return dot_x
     end
 
-    initial_params = -10.0 * ones(n_physically_informed_params + output_dim * basis_dim_1 * basis_dim_2)
+    initial_params = zeros(n_physically_informed_params + n_nn_params)
     initial_params[begin:n_physically_informed_params] .= log.([4.5, 2.7e6, 9.3e-2, 9.22e-7, 1.4e-6])
+    initial_params[n_physically_informed_params + 1:end] = p_nn
 
     return rhs, initial_params
 end
@@ -75,7 +74,7 @@ function make_neural_ode_loss(problem, T_obs, X_obs)
         solution = Array(solve(problem, Tsit5(), p=params, saveat=T,
                                sensealg=InterpolatingAdjoint(autojacvec=ReverseDiffVJP(true))))
 
-        loss = sum(sum(([solution[dim,index] for index in T_obs_indexes[dim]] - X_obs[dim]).^2) for dim=1:size(X_obs)[1])
+        loss = sum(sum(([log(solution[dim,index]) for index in T_obs_indexes[dim]] - log.(X_obs[dim])).^2) for dim=1:size(X_obs)[1])
         return loss
     end
 
@@ -104,9 +103,33 @@ function find_optimal()
     optprob = Optimization.OptimizationProblem(optf, initial_params)
     res1 = Optimization.solve(optprob, Adam(0.05), callback = callback, maxiters = 150)
 
-    #optprob2 = Optimization.OptimizationProblem(optf, res1.u)
-    #res2 = Optimization.solve(optprob2, Adam(0.001), maxiters = 150)
-    #opt = res2.u
+    optprob2 = Optimization.OptimizationProblem(optf, res1.u)
+    res2 = Optimization.solve(optprob2, Adam(0.001), callback = callback, maxiters = 150)
+    opt = res2.u
+
+    solution = solve(problem, Tsit5(), p=opt)
+    draw(solution, opt, T_obs, X_obs[1], X_obs[2], "Нейромодель")
+end
+
+
+function draw(solution, p, T_obs, V_obs, E_obs, str_title)
+    plot(T_obs[1], V_obs, lt=:scatter, marker=:rect, color=:lightgreen,
+         label = L"V_{obs}")
+    plot!(T_obs[2], E_obs, lt=:scatter, marker=:rect, color=:magenta,
+          label = L"E_{obs}")
+
+    tt = 0:0.01:14
+    plot!(solution(tt, idxs=1), color=:green, lw=2, label=L"V(t)")
+    plot!(solution(tt, idxs=2), color=:darkmagenta, lw=2, label=L"E(t)",
+          legend=:bottomleft)
+
+    yaxis!(yscale=:log10, ylims=(1,1e8))
+    xaxis!(xticks=0:14)
+    xlabel!("t, сутки")
+    ylabel!("копии на селезенку")
+    title!(str_title)# * ", Φ(p̂) = " * @sprintf("%3.2e", obj(p))) #* ", AICc = " * @sprintf("%4.1f", aic(p)))
+
+    savefig(str_title * ".pdf")
 end
 
 
