@@ -1,2 +1,5 @@
 # .swp files
 *.swp
+
+# Output files
+output
