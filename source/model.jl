@@ -5,25 +5,12 @@ using Printf
 include("./utils.jl")
 
 
-function get_initial_conditions()
-    # Initial conditions.
-    V_0 = 200.0
-    E_0 = 256.0
-    W_0 = 0.0
-    x_0 = [V_0, E_0]
-
-    # History
-    history(p, t) = [0.0, E_0]
-
-    return x_0, history
-end
-
-
 function make_model()
     n_physically_informed_params = 5
 
     # Neural network architecture.
-    rhs_nn = Chain(Dense(2, 10, tanh), Dense(10, 10, tanh), Dense(10, 4)) |> f64
+    nn_output_dim = 4
+    rhs_nn = Chain(Dense(2, 10, tanh), Dense(10, 10, tanh), Dense(10, nn_output_dim)) |> f64
     p_nn, rhs_nn = Flux.destructure(rhs_nn)
     n_nn_params = length(p_nn)
 
@@ -49,39 +36,12 @@ function make_model()
     initial_params[begin:n_physically_informed_params] .= log.([4.5, 2.7e6, 9.3e-2, 9.22e-7, 1.4e-6])
     initial_params[n_physically_informed_params + 1:end] = p_nn
 
-    return rhs, initial_params, rhs_nn, n_physically_informed_params
-end
-
-
-function make_problem(rhs, initial_params, t_end = 15.0)
-    x_0, history = get_initial_conditions()
-    t_span = (0.0, t_end)
-    problem = ODEProblem{true}(rhs, x_0, t_span)
-
-    return problem
-end
-
-
-function make_neural_ode_loss(problem, T_obs, X_obs)
-    # Unite time grids.
-    T = sort(unique(cat(T_obs..., dims=1)))
-    T_obs_indexes = [something.(indexin(x, T)) for x in T_obs]
-
-    # Loss function (MSE in log scale).
-    function loss_adjoint(params)
-        solution = Array(solve(problem, Tsit5(), p=params, saveat=T,
-                               sensealg=InterpolatingAdjoint(autojacvec=ReverseDiffVJP(true))))
-
-        loss = sum(sum(([log(max.(solution[dim,index], 1e-16)) for index in T_obs_indexes[dim]] - log.(X_obs[dim])).^2) for dim=1:2)
-        return loss
-    end
-
-    return loss_adjoint
+    return rhs, initial_params, rhs_nn, nn_output_dim, n_physically_informed_params
 end
 
 
 function fit_model(problem, initial_params, T_obs, X_obs)
-    loss_function = make_neural_ode_loss(problem, T_obs, X_obs)
+    loss_function, metrics = make_neural_ode_loss(problem, T_obs, X_obs)
 
     iter = 0
     function callback(params, loss)
@@ -96,30 +56,52 @@ function fit_model(problem, initial_params, T_obs, X_obs)
     adtype = Optimization.AutoZygote()
     optf = Optimization.OptimizationFunction((x,p) -> loss_function(x), adtype)
     optprob = Optimization.OptimizationProblem(optf, initial_params)
-    res1 = Optimization.solve(optprob, Adam(0.01), callback = callback, maxiters = 1000)
+    res1 = Optimization.solve(optprob, Adam(0.005), callback = callback, maxiters = 2000)
 
     println("Decreasing learning rate")
 
     optprob2 = Optimization.OptimizationProblem(optf, res1.u)
     res2 = Optimization.solve(optprob2, Adam(0.001), callback = callback, maxiters = 4000)
 
+    println("Decreasing learning rate")
+
     optprob3 = Optimization.OptimizationProblem(optf, res2.u)
-    res3 = Optimization.solve(optprob2, Adam(0.0001), callback = callback, maxiters = 5000)
+    res3 = Optimization.solve(optprob3, Adam(0.0001), callback = callback, maxiters = 10000)
 
     println("Finished")
 
-    return res2
+    return res3, metrics(res3.u)
 end
 
 
-function sparsify_function(func, n_samples=10000)
+function log_sparsify_function(func, use_V=true, n_samples=10000)
     X = 18 * rand(2, n_samples)
     Y = reduce(hcat, map(func, eachcol(X)))
 
     problem = DirectDataDrivenProblem(X, Y, name = :Test)
 
-    @variables log_V, log_E
-    basis = Basis(polynomial_basis([log_V, log_E], 5), [log_V, log_E])
+    if use_V
+        @variables log_V, log_E
+        basis = Basis(polynomial_basis([log_V, log_E], 1), [log_V, log_E])
+    else
+        @variables log_V, log_E
+        basis = Basis(polynomial_basis([log_E], 1), [log_V, log_E])
+    end
+
+    result = solve(problem, basis, ADMM())
+
+    return result
+end
+
+function sparsify_function(func, n_samples=10000)
+    X = 18 * rand(2, n_samples)
+    Y = reduce(hcat, map(func, eachcol(X)))
+    X = exp.(X)
+
+    problem = DirectDataDrivenProblem(X, Y, name = :Test)
+
+    @variables V, E
+    basis = Basis(polynomial_basis([V, E], 1), [V, E])
 
     result = solve(problem, basis, ADMM())
 
@@ -127,19 +109,23 @@ function sparsify_function(func, n_samples=10000)
 end
 
 
+
 function main()
     # Acquire observations (true data).
     T_obs, X_obs = get_observations()
 
     # Assemble model.
-    rhs, initial_params, rhs_nn, n_physically_informed_params = make_model()
+    rhs, initial_params, rhs_nn, nn_output_dim, n_physically_informed_params = make_model()
     problem = make_problem(rhs, initial_params)
 
     # Optimize.
-    optimization_result = fit_model(problem, initial_params, T_obs, X_obs)
+    optimization_result, metrics_value = fit_model(problem, initial_params, T_obs, X_obs)
     optimal_params = optimization_result.u
     objective_value = optimization_result.objective
-    aic_value = aic(X_obs, optimal_params, objective_value)
+
+    println("Metrics: ", metrics_value)
+    println("Objective: ", objective_value)
+    aic_value = aic(X_obs, optimal_params, metrics_value)
 
 
     # Draw solution.
@@ -151,20 +137,27 @@ function main()
     draw(solution, optimal_params, T_obs, X_obs[1], X_obs[2], str_title, "neural")
 
     # Data-driven sparse regression.
-    for dim=1:4
+    for dim=1:nn_output_dim
         func = x -> rhs_nn(log.(max.(x, 1e-16)), optimal_params[n_physically_informed_params + 1:end])[dim]
-        sparsify_result = sparsify_function(func)
+
+        sparsify_result = log_sparsify_function(func)
 
         println(get_basis(sparsify_result))
         println(get_parameter_map(get_basis(sparsify_result)))
         println(rss(sparsify_result))
     end
-end
 
+    println("Inverse approximation")
+    println("---------------------")
+    println("")
 
+    for dim=1:nn_output_dim
+        func = x -> 1.0 / rhs_nn(log.(max.(x, 1e-16)), optimal_params[n_physically_informed_params + 1:end])[dim]
 
-function _test_model()
-    x_0, history = get_initial_conditions()
-    rhs, initial_params = make_model()
-    display(rhs(zero(x_0), x_0, initial_params, 10.0))
+        sparsify_result = log_sparsify_function(func)
+
+        println(get_basis(sparsify_result))
+        println(get_parameter_map(get_basis(sparsify_result)))
+        println(rss(sparsify_result))
+    end
 end
